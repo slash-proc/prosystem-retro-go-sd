@@ -205,14 +205,15 @@ Pushing a tag `vX.Y.Z` (with a matching `## [vX.Y.Z]` section in
 
 | Asset | Contents |
 |-------|----------|
-| `<name>-vX.Y.Z.zip` | SD layout: `cores/<name>.bin` or `homebrews/<name>.bin` |
-| `<name>-vX.Y.Z-debug.zip` | `*_core.elf`, linker `.map`, and a short README |
+| `prosystem-vX.Y.Z.zip` | SD layout: `cores/prosystem.bin` |
+| `prosystem-vX.Y.Z-debug.zip` | `prosystem_core.elf`, linker `.map`, and a short README |
 
-Unzip the install archive onto the SD card root. For a crash PC/LR:
+Unzip the install archive onto the SD card root. ROMs go under `/roms/a7800/`.
+For a crash PC/LR:
 
 ```bash
-unzip example-v1.0.0-debug.zip
-arm-none-eabi-addr2line -e example_core.elf -f -C -a 0x<PC> 0x<LR>
+unzip prosystem-v1.0.0-debug.zip
+arm-none-eabi-addr2line -e prosystem_core.elf -f -C -a 0x<PC> 0x<LR>
 ```
 
 Needs `arm-none-eabi-addr2line` on `PATH`, or the `sylverb/retro-go-sd-builder`

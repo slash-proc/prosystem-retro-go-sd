@@ -28,6 +28,11 @@ else
 $(error HOST_SDL must be 2 or 3 (got '$(HOST_SDL)'))
 endif
 
+# Homebrew (macOS) often has pkg-config files outside the default search path.
+ifneq ($(wildcard /opt/homebrew/lib/pkgconfig),)
+export PKG_CONFIG_PATH := /opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig:$(PKG_CONFIG_PATH)
+endif
+
 HOST_PKG_CFLAGS := $(shell pkg-config --cflags $(HOST_SDL_PC) 2>/dev/null)
 HOST_PKG_LIBS   := $(shell pkg-config --libs $(HOST_SDL_PC) 2>/dev/null)
 # macOS sdl2.pc pulls -lSDL2main which wants SDL_main; we provide main() ourselves.
@@ -56,6 +61,7 @@ HOST_INCLUDES := \
 	-I$(HOST_INC_ROOT)/Core/Inc/porting \
 	-I$(HOST_INC_ROOT)/Core/Src/porting/lib \
 	-I$(HOST_INC_ROOT)/Core/Src/porting/lib/FatFs \
+	$(CORE_C_INCLUDES) \
 	$(HOST_PKG_CFLAGS)
 
 HOST_CFLAGS := -O2 -g -Wall -Wextra -std=c11 \

@@ -675,6 +675,12 @@ int odroid_savestate_menu(const char *title, const char *rom_path, bool show_pre
 
 /* --- System / settings / malloc ------------------------------------------- */
 
+void odroid_system_switch_app(int app)
+{
+    fprintf(stderr, "host: odroid_system_switch_app(%d) — exiting\n", app);
+    exit(1);
+}
+
 void odroid_system_init(int app_id, int sampleRate)
 {
     (void)app_id;

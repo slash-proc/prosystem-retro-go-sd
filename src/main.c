@@ -1,414 +1,261 @@
 /*
- * Retro-Go SD template — minimal skeleton for a CORE or a GWHB homebrew.
+ * Atari 7800 (ProSystem) — Retro-Go SD dynamic core.
  *
- * Select the kind at build time:
- *   make PROJECT_KIND=core      (default)  → ROM loader + cheat hooks + footer logos
- *   make PROJECT_KIND=homebrew             → no ROM load; ACTIVE_FILE is this .bin
- *
- * Shows path/size (cores) or the GWHB name (homebrews) and which buttons are held.
- * Holding a gameplay button plays a square-wave beep (audio path demo).
- * Save/load/screenshot hooks are stubs — fill them when you plug in real logic.
- *
- * Also demonstrates:
- *   - Pause-menu game options via odroid_dialog_choice_t
- *   - Per-core string tables with gw_i18n() (firmware language)
- *   - Cheat Codes entry (cores only: pack --cheat-ext + cheat_update_cb)
- *   - Optional shutdown / sleep-wake / SRAM-save hooks
- *
- * Entry (run_dynamic_core / run_gwhb_homebrew):
- *   void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
+ * Memory layout:
+ *   ITCM  — hot CODE only (Sally/Maria/Memory/ProSystem/Tia/Pokey/Riot)
+ *   DTCM  — memory_ram (64 KiB) + pokeyMixBuffer (no ITCM data)
+ *   RAM_EMU — image, maria_surface, pokey_poly17, memory_rom, Database, …
+ *   AHB   — unused (tight heap on this firmware)
  */
 
-#include <stdint.h>
-#include <stdbool.h>
-#include <string.h>
-#include <stdio.h>
+#include <odroid_system.h>
 
-#include "common.h"
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
 #include "gw_lcd.h"
-#include "gw_audio.h"
-#include "rom_manager.h"
-#include "odroid_system.h"
-#include "appid.h"
-#include "odroid_overlay.h"
-#include "odroid_settings.h"
+#include "gw_buttons.h"
 #include "gw_malloc.h"
+#include "rom_manager.h"
+#include "common.h"
+#include "appid.h"
+
+#include "Bios.h"
+#include "Cartridge.h"
+#include "Database.h"
+#include "Maria.h"
+#include "Palette.h"
+#include "Pokey.h"
+#include "Region.h"
+#include "ProSystem.h"
+#include "Tia.h"
+#include "Memory.h"
 
 #ifndef HOST_BUILD
 #include "gw_core_bridge.h"
-#include "gw_core_i18n.h"
 #else
 #include "host_compat.h"
-#include "gw_core_i18n.h"
 #endif
 
-#if defined(PROJECT_KIND_HOMEBREW)
-#define APP_ID  APPID_HOMEBREW
-#elif defined(PROJECT_KIND_CORE)
-#define APP_ID  APPID_CORE
-#else
-#error "Build with PROJECT_KIND=core or PROJECT_KIND=homebrew"
-#endif
+static uint16_t display_palette16[256] = {0};
+static uint8_t keyboard_data[17]       = {0};
 
-#define FPS          60
-#define SAMPLE_RATE  16000
-#define AUDIO_LENGTH (SAMPLE_RATE / FPS)
+static uint8_t *pokeyMixBuffer         = NULL;
 
-#ifndef MAX_CHEAT_CODES
-#define MAX_CHEAT_CODES 13
-#endif
+static uint8_t save_buffer[32832];
 
-#if defined(PROJECT_KIND_CORE)
-static const uint8_t *rom_data;
-static uint32_t rom_size;
-static bool rom_in_ram;
-static int cheats_on; /* count of enabled cheat slots */
-#endif
-
-static uint32_t frame;
-static odroid_gamepad_state_t pad; /* last read — used by blit() / audio */
-static uint32_t audio_phase;       /* 16.16 phase for square-wave demo */
-
-/* Pause-menu demo option (persisted per app id via settings). */
-static int beep_enabled = 1;
-static char beep_value[8];
-
-static void blit(void);
-
-/* --- i18n tables (English required; others optional) ---------------------- */
-
-static const gw_i18n_entry_t i18n_title[] = {
-#if defined(PROJECT_KIND_HOMEBREW)
-    { "en", "Example homebrew (GWHB)" },
-    { "fr", "Homebrew exemple (GWHB)" },
-    { "es", "Homebrew de ejemplo (GWHB)" },
-    { "de", "Beispiel-Homebrew (GWHB)" },
-#else
-    { "en", "Example core" },
-    { "fr", "Core exemple" },
-    { "es", "Núcleo de ejemplo" },
-    { "de", "Beispiel-Core" },
-#endif
-    GW_I18N_END
-};
-
-static const gw_i18n_entry_t i18n_hold_beep[] = {
-    { "en", "Hold a button for a beep:" },
-    { "fr", "Maintenir un bouton pour un bip :" },
-    { "es", "Mantén un botón para un pitido:" },
-    { "de", "Taste halten für Piepton:" },
-    GW_I18N_END
-};
-
-static const gw_i18n_entry_t i18n_beep[] = {
-    { "en", "Button beep" },
-    { "fr", "Bip boutons" },
-    { "es", "Pitido" },
-    { "de", "Tasten-Piep" },
-    GW_I18N_END
-};
-
-static const gw_i18n_entry_t i18n_on[] = {
-    { "en", "ON" },
-    { "fr", "OUI" },
-    { "es", "SÍ" },
-    { "de", "AN" },
-    GW_I18N_END
-};
-
-static const gw_i18n_entry_t i18n_off[] = {
-    { "en", "OFF" },
-    { "fr", "NON" },
-    { "es", "NO" },
-    { "de", "AUS" },
-    GW_I18N_END
-};
-
-#if defined(PROJECT_KIND_CORE) && CHEAT_CODES == 1
-static const gw_i18n_entry_t i18n_cheats[] = {
-    { "en", "Cheats on" },
-    { "fr", "Cheats actifs" },
-    { "es", "Trampas activas" },
-    { "de", "Cheats an" },
-    GW_I18N_END
-};
-#endif
-
-static void beep_value_sync(void)
-{
-    strncpy(beep_value,
-            beep_enabled ? gw_i18n(i18n_on) : gw_i18n(i18n_off),
-            sizeof(beep_value) - 1);
-    beep_value[sizeof(beep_value) - 1] = '\0';
-}
-
-static bool beep_update_cb(odroid_dialog_choice_t *option,
-                           odroid_dialog_event_t event, uint32_t repeat)
-{
-    (void)repeat;
-    if (event == ODROID_DIALOG_PREV || event == ODROID_DIALOG_NEXT) {
-        beep_enabled = !beep_enabled;
-        odroid_settings_app_int32_set("beep", beep_enabled);
-    }
-    beep_value_sync();
-    strcpy(option->value, beep_value);
-    return event == ODROID_DIALOG_ENTER;
-}
-
-/* Hz per button — first match wins (A over B over D-pad…). */
-static uint16_t tone_hz(void)
-{
-    if (!beep_enabled)
-        return 0;
-    if (pad.values[ODROID_INPUT_A])     return 440;  /* A4 */
-    if (pad.values[ODROID_INPUT_B])     return 523;  /* C5 */
-#if defined(PROJECT_KIND_CORE)
-    if (pad.values[ODROID_INPUT_X])     return 659;  /* E5  (START) */
-    if (pad.values[ODROID_INPUT_Y])     return 784;  /* G5  (SELECT) */
-#endif
-    if (pad.values[ODROID_INPUT_UP])    return 330;
-    if (pad.values[ODROID_INPUT_DOWN])  return 294;
-    if (pad.values[ODROID_INPUT_LEFT])  return 262;
-    if (pad.values[ODROID_INPUT_RIGHT]) return 349;
-    return 0;
-}
-
-#if defined(PROJECT_KIND_CORE)
-/* --- ROM: RAM if it fits, else QSPI flash (same policy as other cores) --- */
-
-static bool load_rom(void)
-{
-    uint32_t size;
-    uint8_t *dest;
-
-    if (!ACTIVE_FILE || !ACTIVE_FILE->path[0]) {
-        printf("example: no ACTIVE_FILE\n");
+static bool LoadState(const char *savePathName) {
+    FILE *file = fopen(savePathName, "rb");
+    if (file == NULL) {
         return false;
     }
 
-    size = ACTIVE_FILE->size;
+    fread(save_buffer, sizeof(save_buffer), 1, file);
 
-    if (size > 0 && size <= ram_get_free_size()) {
-        dest = ram_malloc(size);
-        if (!dest)
-            return false;
-        if (odroid_overlay_cache_file_in_ram(ACTIVE_FILE->path, dest) != size)
-            return false;
-        rom_data = dest;
-        rom_in_ram = true;
+    fclose(file);
+
+    if ((save_buffer[0] == '7') &&
+        (save_buffer[1] == '8') &&
+        (save_buffer[2] == '0') &&
+        (save_buffer[3] == '0')) {
+            prosystem_Load((const char *)save_buffer + 4);
     } else {
-        dest = odroid_overlay_cache_file_in_flash(ACTIVE_FILE->path, &size, false);
-        if (!dest || size == 0)
-            return false;
-        rom_data = dest;
-        rom_in_ram = false;
+        return false;
     }
 
-    rom_size = size;
-    printf("example: ROM %lu bytes in %s @ %p\n",
-           (unsigned long)size, rom_in_ram ? "RAM" : "FLASH", (void *)dest);
     return true;
 }
-#endif
 
-/* --- System callbacks ----------------------------------------------------- */
+static bool SaveState(const char *savePathName) {
+    save_buffer[0] = '7';
+    save_buffer[1] = '8';
+    save_buffer[2] = '0';
+    save_buffer[3] = '0';
+    int size = prosystem_Save((char *)save_buffer + 4) + 4;
 
-static bool LoadState(const char *savePathName)
-{
-    (void)savePathName;
-    /* TODO: fopen(savePathName, "rb"), read your snapshot, apply it.
-     * Return true on success so the pause menu can confirm the load. */
-    return false;
+    FILE *file = fopen(savePathName, "wb");
+    if (file == NULL) {
+        return false;
+    }
+
+    size_t written = fwrite(save_buffer, size, 1, file);
+
+    fclose(file);
+
+    if (!written) {
+        return false;
+    }
+
+    return true;
 }
 
-static bool SaveState(const char *savePathName)
-{
-    (void)savePathName;
-    /* TODO: serialize state into a buffer, fwrite to savePathName.
-     * Return true on success. */
-    return false;
-}
+#define BLIT_VIDEO_BUFFER(typename_t, src, palette, width, height, pitch, dst) \
+   {                                                                           \
+      typename_t *surface = (typename_t*)dst;                                  \
+      uint32_t x, y;                                                           \
+                                                                               \
+      for(y = 0; y < height; y++)                                              \
+      {                                                                        \
+         typename_t *surface_ptr = surface;                                    \
+         const uint8_t *src_ptr  = src;                                        \
+                                                                               \
+         for(x = 0; x < width; x++)                                            \
+            *(surface_ptr++) = *(palette + *(src_ptr++));                      \
+                                                                               \
+         surface += pitch;                                                     \
+         src     += width;                                                     \
+      }                                                                        \
+   }
 
 static void *Screenshot(void)
 {
-    /* TODO: wait for vblank, redraw one clean frame into the active LCD
-     * buffer (no HUD if you prefer), then return lcd_get_active_buffer().
-     * The firmware copies that RGB565 bitmap to the screenshot file. */
     lcd_wait_for_vblank();
-    blit();
+
+    lcd_clear_active_buffer();
+
+    uint8_t *buffer = maria_surface + ((maria_visibleArea.top - maria_displayArea.top) * Rect_GetLength(&maria_visibleArea));
+    BLIT_VIDEO_BUFFER(uint16_t, buffer, display_palette16, 320, 240, 320, lcd_get_active_buffer());
+
     return lcd_get_active_buffer();
 }
 
-static void Shutdown(void)
-{
-    /* Called on power-off from the pause menu. Flush config / open files. */
-    odroid_settings_app_int32_set("beep", beep_enabled);
-}
-
-static void SleepWake(void)
-{
-    /* After deep sleep the firmware restores clocks; re-arm SAI/DMA at the
-     * sample rate so audio does not stay silent or at the wrong pitch. */
-    odroid_audio_init(SAMPLE_RATE);
-    audio_clear_buffers();
-    audio_start_playing(AUDIO_LENGTH);
-}
-
-static void SramSave(void)
-{
-    /* TODO (cores): write battery-backed cart RAM (ODROID_PATH_SAVE_SRAM)
-     * when dirty. Called on pause / power paths. Homebrews may ignore. */
-}
-
-#if defined(PROJECT_KIND_CORE) && CHEAT_CODES == 1
-/* Re-apply enabled codes whenever the user confirms the Cheats submenu.
- * Real cores parse ACTIVE_FILE->cheat_codes[i] into the emulator; here we
- * only count how many slots are on so the HUD can show it. */
-static void update_cheats(void)
-{
-    int n = 0;
-
-    if (ACTIVE_FILE) {
-        int i;
-        for (i = 0; i < MAX_CHEAT_CODES && i < ACTIVE_FILE->cheat_count; i++) {
-            if (odroid_settings_ActiveGameGenieCodes_is_enabled(ACTIVE_FILE->path, i))
-                n++;
+static size_t getromdata(unsigned char **data) {
+    uint32_t size = 0;
+    FILE *f = fopen(ACTIVE_FILE->path, "rb");
+    if (f != NULL) {
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fclose(f);
+        if (sz > 0)
+            size = (uint32_t)sz;
+    }
+    if (size == 0) {
+        *data = NULL;
+        return 0;
+    }
+    if (size > ram_get_free_size()) {
+        *data = odroid_overlay_cache_file_in_flash(ACTIVE_FILE->path, &size, false);
+    } else {
+        *data = ram_malloc(size);
+        if (*data != NULL) {
+            odroid_overlay_cache_file_in_ram(ACTIVE_FILE->path, *data);
         }
     }
-    cheats_on = n;
-    printf("example: %d cheat slot(s) enabled\n", n);
+    return size;
 }
-#endif
 
-/* --- Input: after common_emu_input_loop (MENU/VOLUME stay with firmware) -- */
-
-static void input_read(const odroid_gamepad_state_t *joy)
+static void display_ResetPalette(void)
 {
-    /* TODO: map joy->values[ODROID_INPUT_*] into your console's joypad
-     * register (see firmware cores for typical patterns). */
-    pad = *joy;
+   unsigned index;
+
+   for(index = 0; index < 256; index++)
+   {
+      uint32_t r = palette_data[(index * 3) + 0] << 16;
+      uint32_t g = palette_data[(index * 3) + 1] << 8;
+      uint32_t b = palette_data[(index * 3) + 2];
+      display_palette16[index] = ((r & 0xF80000) >> 8) |
+                                 ((g & 0x00F800) >> 5) |
+                                 ((b & 0x0000F8) >> 3);
+   }
 }
 
-/* --- Video ---------------------------------------------------------------- */
+static void update_joystick(odroid_gamepad_state_t *joystick) {
+   // ----------------------------------------------------------------------------
+   // SetInput
+   // +----------+--------------+-------------------------------------------------
+   // | Offset   | Controller   | Control
+   // +----------+--------------+-------------------------------------------------
+   // | 00       | Joystick 1   | Right
+   // | 01       | Joystick 1   | Left
+   // | 02       | Joystick 1   | Down
+   // | 03       | Joystick 1   | Up
+   // | 04       | Joystick 1   | Button 1
+   // | 05       | Joystick 1   | Button 2
+   // | 06       | Joystick 2   | Right
+   // | 07       | Joystick 2   | Left
+   // | 08       | Joystick 2   | Down
+   // | 09       | Joystick 2   | Up
+   // | 10       | Joystick 2   | Button 1
+   // | 11       | Joystick 2   | Button 2
+   // | 12       | Console      | Reset
+   // | 13       | Console      | Select
+   // | 14       | Console      | Pause
+   // | 15       | Console      | Left Difficulty
+   // | 16       | Console      | Right Difficulty
+   // +----------+--------------+-------------------------------------------------
+    keyboard_data[0]  = joystick->values[ODROID_INPUT_RIGHT] ? 1 : 0;
+    keyboard_data[1]  = joystick->values[ODROID_INPUT_LEFT]  ? 1 : 0;
+    keyboard_data[2]  = joystick->values[ODROID_INPUT_DOWN]  ? 1 : 0;
+    keyboard_data[3]  = joystick->values[ODROID_INPUT_UP]    ? 1 : 0;
+    keyboard_data[4]  = joystick->values[ODROID_INPUT_B]     ? 1 : 0;
+    keyboard_data[5]  = joystick->values[ODROID_INPUT_A]     ? 1 : 0;
+    if (joystick->values[ODROID_INPUT_SELECT] || joystick->values[ODROID_INPUT_Y]) {
+        keyboard_data[13] = 1;
+    } else {
+        keyboard_data[13] = 0;
+    }
+    if (joystick->values[ODROID_INPUT_START] || joystick->values[ODROID_INPUT_X]) {
+        keyboard_data[14] = 1;
+    } else {
+        keyboard_data[14] = 0;
+    }
+    keyboard_data[15] = 0;
+}
 
 static void blit(void)
 {
-    uint16_t *fb = lcd_get_active_buffer();
-    char line[80];
-    int y = 8;
-
-    memset(fb, 0, WIDTH * HEIGHT * sizeof(uint16_t));
-
-    odroid_overlay_draw_text(8, y, 0, gw_i18n(i18n_title), 0xFFFF, 0x0000);
-    y += 20;
-
-    {
-        const char *name = (ACTIVE_FILE && ACTIVE_FILE->name[0])
-                               ? ACTIVE_FILE->name
-#if defined(PROJECT_KIND_HOMEBREW)
-                               : "(no file)";
-#else
-                               : "(no rom)";
-#endif
-        snprintf(line, sizeof(line), "%.70s", name);
-        odroid_overlay_draw_text(8, y, 0, line, 0xFFFF, 0x0000);
-        y += 16;
-    }
-
-#if defined(PROJECT_KIND_CORE)
-    snprintf(line, sizeof(line), "%lu bytes  %s",
-             (unsigned long)rom_size, rom_in_ram ? "RAM" : "FLASH");
-    odroid_overlay_draw_text(8, y, 0, line, 0xFFFF, 0x0000);
-    y += 16;
-#endif
-
-    snprintf(line, sizeof(line), "frame %lu", (unsigned long)frame);
-    odroid_overlay_draw_text(8, y, 0, line, 0xFFFF, 0x0000);
-    y += 16;
-
-#if defined(PROJECT_KIND_CORE) && CHEAT_CODES == 1
-    snprintf(line, sizeof(line), "%s: %d", gw_i18n(i18n_cheats), cheats_on);
-    odroid_overlay_draw_text(8, y, 0, line, 0xFFFF, 0x0000);
-    y += 16;
-#endif
-
-    y += 8;
-    odroid_overlay_draw_text(8, y, 0, gw_i18n(i18n_hold_beep), 0xFFFF, 0x0000);
-    y += 16;
-
-    /* One line listing every currently pressed gameplay button. */
-    line[0] = '\0';
-    if (pad.values[ODROID_INPUT_UP])     strcat(line, "UP ");
-    if (pad.values[ODROID_INPUT_DOWN])   strcat(line, "DOWN ");
-    if (pad.values[ODROID_INPUT_LEFT])   strcat(line, "LEFT ");
-    if (pad.values[ODROID_INPUT_RIGHT])  strcat(line, "RIGHT ");
-    if (pad.values[ODROID_INPUT_A])      strcat(line, "A ");
-    if (pad.values[ODROID_INPUT_B])      strcat(line, "B ");
-#if defined(PROJECT_KIND_CORE)
-    if (pad.values[ODROID_INPUT_X])      strcat(line, "START ");
-    if (pad.values[ODROID_INPUT_Y])      strcat(line, "SELECT ");
-    if (pad.values[ODROID_INPUT_START])  strcat(line, "GAME ");
-    if (pad.values[ODROID_INPUT_SELECT]) strcat(line, "TIME ");
-#endif
-    if (line[0] == '\0')
-        strcpy(line, "(none)");
-    odroid_overlay_draw_text(8, y, 0, line, 0xFFFF, 0x0000);
-
-    /* Volume/brightness/turbo/… HUD drawn by the firmware — must run after
-     * painting, or a full-framebuffer clear hides it and PAUSE+UP/DOWN
-     * look broken. */
+    const uint8_t *buffer = maria_surface +
+        ((maria_visibleArea.top - maria_displayArea.top) *
+         Rect_GetLength(&maria_visibleArea));
+    BLIT_VIDEO_BUFFER(uint16_t, buffer, display_palette16, 320, 240, 320,
+                      lcd_get_active_buffer());
     common_ingame_overlay();
 }
 
-/* Fill one DMA half-buffer: silence, or a mono square wave at tone_hz.
- * Real cores write emulator PCM here the same way. */
-static void submit_audio(void)
+static void sound_store(void)
 {
-    int16_t *buf;
-    uint16_t len;
-    uint16_t hz;
-    uint32_t step;
-    int32_t vol;
-    uint16_t i;
+    uint8_t *tia_samples_buf = tia_buffer;
+    size_t j;
 
-    if (common_emu_sound_loop_is_muted())
-        return;
+    /* Mix in sound generated by POKEY chip
+    * (Ballblazer, Commando, various homebrew and hacks) */
+    if(cartridge_pokey)
+    {
+        uint8_t *pokey_samples_buf = pokey_buffer;
+        uint8_t *pokey_mix_buf     = pokeyMixBuffer;
 
-    buf = audio_get_active_buffer();
-    len = audio_get_buffer_length();
-    if (!buf || !len)
-        return;
+        /* Copy samples to pokeyMixBuffer */
+        for(j = 0; j < tia_size; j++)
+            *(pokey_mix_buf++) = (*(tia_samples_buf++) + *(pokey_samples_buf++)) >> 1;
 
-    hz = tone_hz();
-    if (hz == 0) {
-        memset(buf, 0, len * sizeof(int16_t));
+        /* pokeyMixBuffer 'replaces' tia_buffer */
+        tia_samples_buf = pokeyMixBuffer;
+    }
+
+    if (common_emu_sound_loop_is_muted()) {
         return;
     }
 
-    /* 16.16 fixed phase so the wave continues cleanly across frames. */
-    step = ((uint32_t)hz << 16) / SAMPLE_RATE;
-    vol = common_emu_sound_get_volume(); /* 0..255 from the volume menu */
+    int32_t factor = common_emu_sound_get_volume();
+    int16_t* sound_buffer = audio_get_active_buffer();
+    uint16_t sound_buffer_length = audio_get_buffer_length();
 
-    for (i = 0; i < len; i++) {
-        int16_t sample = (audio_phase & 0x8000u) ? 8000 : -8000;
-        buf[i] = (int16_t)((sample * vol) / 255);
-        audio_phase = (audio_phase + step) & 0xffffu;
+    /* Write to sound buffer and lower the volume accordingly */
+    for (int i = 0; i < sound_buffer_length; i++) {
+        int32_t sample = *(tia_samples_buf++) << 8;
+        sound_buffer[i] = (sample * factor) >> 8;
     }
 }
 
-/* --- Main ----------------------------------------------------------------- */
-
 void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
 {
-    odroid_gamepad_state_t joystick;
-    odroid_dialog_choice_t options[2];
+    uint32_t rom_length = 0;
+    uint8_t *rom_ptr = NULL;
 
-    gw_core_bridge_init();
-    memset(&pad, 0, sizeof(pad));
-    audio_phase = 0;
-#if defined(PROJECT_KIND_CORE)
-    cheats_on = 0;
-#endif
+    odroid_gamepad_state_t joystick;
+    odroid_dialog_choice_t options[] = {
+        ODROID_DIALOG_CHOICE_LAST
+    };
 
     if (start_paused) {
         common_emu_state.pause_after_frames = 2;
@@ -416,72 +263,77 @@ void app_main(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     } else {
         common_emu_state.pause_after_frames = 0;
     }
-    common_emu_state.frame_time_10us = (uint16_t)(100000 / FPS + 0.5f);
-    lcd_set_refresh_rate(FPS);
 
-    odroid_system_init(APP_ID, SAMPLE_RATE);
-    odroid_system_emu_init(&LoadState, &SaveState, &Screenshot,
-                           &Shutdown, &SleepWake, &SramSave,
-#if defined(PROJECT_KIND_CORE) && CHEAT_CODES == 1
-                           &update_cheats
-#else
-                           NULL
-#endif
-                           );
-
-    /* App-scoped settings need odroid_system_init (sets current app id). */
-    beep_enabled = odroid_settings_app_int32_get("beep", 1) ? 1 : 0;
-    beep_value_sync();
-
-    /* Game options appear under the pause menu. Labels are looked up once
-     * at start — reopen the menu after a language change to refresh. */
-    options[0].id = 100;
-    options[0].label = gw_i18n(i18n_beep);
-    options[0].value = beep_value;
-    options[0].enabled = 1;
-    options[0].update_cb = &beep_update_cb;
-    options[1] = (odroid_dialog_choice_t)ODROID_DIALOG_CHOICE_LAST;
-
-    audio_start_playing(AUDIO_LENGTH);
-
-#if defined(PROJECT_KIND_CORE)
-    if (!load_rom()) {
-        rom_data = NULL;
-        rom_size = 0;
+    /* Hot state in DTCM — never in ITCM (ITCM holds packed hot code). */
+    memory_ram = (uint8_t *)dtc_calloc(1, MEMORY_SIZE);
+    pokeyMixBuffer = (uint8_t *)dtc_malloc(TIA_BUFFER_SIZE * sizeof(uint8_t));
+    if (memory_ram == NULL || pokeyMixBuffer == NULL) {
+        printf("a7800: DTCM alloc failed (ram=%p mix=%p free=%u)\n",
+               (void *)memory_ram, (void *)pokeyMixBuffer,
+               (unsigned)dtc_get_free_size());
+        odroid_system_switch_app(0);
+        return;
     }
 
-#if CHEAT_CODES == 1
-    /* Apply any slots already enabled for this ROM (resume / prior session). */
-    update_cheats();
-#endif
-#endif
+    memset(keyboard_data, 0, sizeof(keyboard_data));
+
+    /* Difficulty switches:
+     * Left position = (B)eginner, Right position = (A)dvanced
+     * Left difficulty switch defaults to left position, "(B)eginner"
+     */
+    keyboard_data[15] = 1;
+    /* Right difficulty switch defaults to right position,
+     * "(A)dvanced", which fixes Tower Toppler
+     */
+    keyboard_data[16] = 0;
+
+    rom_length = getromdata(&rom_ptr);
+
+    if (rom_ptr == NULL || rom_length == 0 || !cartridge_Load(true, rom_ptr, rom_length)) {
+        odroid_system_switch_app(0);
+        return;
+    }
+    bios_enabled = false; /* Bios not loaded */
+    display_ResetPalette();
+    database_Load(cartridge_digest);
+    prosystem_Reset();
+
+    /* Use detected system frequency */
+    common_emu_state.frame_time_10us = (uint16_t)(100000 / prosystem_frequency + 0.5f);
+
+    odroid_system_init(APPID_CORE, tia_size * prosystem_frequency); /* 31200Hz PAL / 31440Hz NTSC */
+    odroid_system_emu_init(&LoadState, &SaveState, &Screenshot, NULL, NULL, NULL, NULL);
+
+    /* Init Sound */
+    audio_start_playing(tia_size);
 
     if (load_state) {
-        /* When LoadState is implemented, this applies the chosen slot. */
         odroid_system_emu_load_state(save_slot);
     } else {
         lcd_clear_buffers();
     }
 
-    while (1) {
+    while (1)
+    {
         wdog_refresh();
 
-        bool draw_frame = common_emu_frame_loop();
+        bool drawFrame = common_emu_frame_loop();
 
         odroid_input_read_gamepad(&joystick);
         common_emu_input_loop(&joystick, options, &blit);
         common_emu_input_loop_handle_turbo(&joystick);
 
-        input_read(&joystick);
+        update_joystick(&joystick);
 
-        frame++;
+        prosystem_ExecuteFrame(keyboard_data);
 
-        if (draw_frame) {
+        if (drawFrame) {
             blit();
             lcd_swap();
         }
 
-        submit_audio();
+        sound_store();
+
         common_emu_sound_sync(false);
     }
 }
