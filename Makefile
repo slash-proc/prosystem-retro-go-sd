@@ -68,7 +68,7 @@ PACK_CORE := $(GNW_CORE_SDK)/tools/pack_core.py
 #######################################
 # Packed header version
 #######################################
-CORE_VERSION ?= $(shell git describe --tags --dirty 2>/dev/null || echo NOTAG)
+CORE_VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo 0.0.0)
 
 #######################################
 # Pack
